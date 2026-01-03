@@ -1,390 +1,481 @@
 import cv2
+import os
 import numpy as np
 from collections import deque
+from scipy.spatial import distance as dist
+import math
+from object_types import PSO, CSO, OCO, ABO
 
-from object_types import PSO
+# --- Constants & Configuration ---
+PIXELS_PER_METER = 50.0  # Needs calibration for your specific camera view
+STABILITY_FRAMES = 80
+STABILITY_DIST_THRESHOLD = 5.0 # pixels
+CONTOUR_MATCH_THRESHOLD = 0.3  # Lower is better match in cv2.matchShapes (HuMoments)
 
 class DualBackgroundModel:
-    def __init__(
-            self,
-            st_history=300,
-            lt_history=1000,
-            varThreshold=16,
-            detectShadows=True,
-            memory_length = 200
-        ):
-            self.st_backSub = cv2.createBackgroundSubtractorMOG2(
-                history=st_history,
-                varThreshold=varThreshold,
-                detectShadows=detectShadows
-            )
-            self.lt_backSub = cv2.createBackgroundSubtractorMOG2(
-                history=lt_history,
-                varThreshold=varThreshold,
-                detectShadows=detectShadows
-            )
-            self.memory_length = memory_length
-            self.memory = deque(maxlen=memory_length)
+    def __init__(self, st_history=15, lt_history=1000, dist2Threshold=400.0, detectShadows=True, memory_length=20):
+        self.st_backSub = cv2.createBackgroundSubtractorKNN(history=st_history, dist2Threshold=dist2Threshold, detectShadows=detectShadows)
+        self.lt_backSub = cv2.createBackgroundSubtractorKNN(history=lt_history, dist2Threshold=dist2Threshold, detectShadows=detectShadows)
+        
+        self.memory_length = memory_length 
+        self.memory = deque(maxlen=memory_length)
 
-    def apply(self, frame, frame_num):
-        fgMask_st = self.st_backSub.apply(frame)
-        fgMask_lt = self.lt_backSub.apply(frame)
-        fgMask_st[fgMask_st == 127] = 0
-        fgMask_lt[fgMask_lt == 127] = 0
+        self.memory_directory = "Data/BackgroundModelMemory/"
+        os.makedirs(self.memory_directory, exist_ok=True)
 
-        dbMask = fgMask_st - fgMask_lt
-        dbMask[dbMask < 0] = 0
+    def apply(self, frame, frame_num, learning_rate=-1):
+        fgMask_st = self.st_backSub.apply(frame, learningRate=learning_rate)
+        fgMask_lt = self.lt_backSub.apply(frame, learningRate=learning_rate)
 
-        self.memory.append((frame_num, fgMask_st.copy(), fgMask_lt.copy(), dbMask.copy()))
+        _, fgMask_st = cv2.threshold(fgMask_st, 250, 255, cv2.THRESH_BINARY)
+        _, fgMask_lt = cv2.threshold(fgMask_lt, 250, 255, cv2.THRESH_BINARY)
+
+        dbMask_raw = cv2.subtract(fgMask_lt, fgMask_st)
+        
+        # Przekazujemy 'frame' do morphological_process, aby umożliwić działanie HOG
+        dbMask = self.morphological_process(dbMask_raw, frame_img=frame)
+
+        self.memory_post((frame_num, frame, fgMask_st, dbMask))
+        
+        if len(self.memory) == self.memory.maxlen:
+            oldest_frame = self.memory[0]
+            self.memory_delete(oldest_frame)
+
+        self.memory.append(frame_num)
 
         return fgMask_st, fgMask_lt, dbMask
 
+    def morphological_process(self, mask, frame_img=None):
+        # Ulepszona wersja: Hybryda Morfologii i ML (HOG)
+        # Jeśli mamy dostęp do oryginalnej klatki (frame_img), używamy HOG do znalezienia ludzi wewnątrz blobów.
+        # Jeśli nie, używamy ulepszonego Watershed na mapie odległości.
+
+        # 1. Wstępne czyszczenie
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small, iterations=2)
+        opening = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel_small, iterations=1)
+
+        if cv2.countNonZero(opening) == 0:
+            return opening
+
+        # --- ŚCIEŻKA ML (HOG) ---
+        # Uruchamiamy tylko jeśli mamy obraz RGB i blob jest wystarczająco duży
+        if frame_img is not None:
+            # Znajdujemy kontury, żeby sprawdzić rozmiar bloba
+            contours, _ = cv2.findContours(opening, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Inicjalizacja HOG (tylko raz, w __init__ byłoby lepiej, ale tu dla czytelności)
+            hog = cv2.HOGDescriptor()
+            hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            
+            markers = np.zeros(opening.shape, dtype=np.int32)
+            seeds_found = False
+            seed_id = 2 # 0=nieznane, 1=tło
+            
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                
+                # Jeśli blob jest mały, ignorujemy HOG
+                if w < 60 or h < 100: 
+                    continue
+                    
+                # Wycinamy ROI z klatki
+                roi = frame_img[y:y+h, x:x+w]
+                
+                # Detekcja HOG
+                # winStride=(4,4) dla szybkości, (8,8) dla jeszcze większej szybkości
+                rects, _ = hog.detectMultiScale(roi, winStride=(8, 8), padding=(8, 8), scale=1.05)
+                
+                # Jeśli znaleziono > 1 osobę w tym blobie -> używamy ich środków jako seeds
+                if len(rects) > 1:
+                    for (rx, ry, rw, rh) in rects:
+                        cx, cy = x + rx + rw // 2, y + ry + rh // 2
+                        # Rysujemy seed (kółko) na markerach
+                        cv2.circle(markers, (cx, cy), 10, seed_id, -1)
+                        seed_id += 1
+                    seeds_found = True
+            
+            # Jeśli HOG znalazł podział, używamy go
+            if seeds_found:
+                # Tło to tam gdzie maska jest 0
+                markers[opening == 0] = 1
+                
+                # Watershed
+                cv2.watershed(frame_img, markers)
+                
+                mask_out = np.zeros_like(mask)
+                mask_out[markers > 1] = 255
+                return mask_out
+
+        # --- ŚCIEŻKA KLASYCZNA (Watershed na Distance Transform) ---
+        # Fallback, jeśli HOG nic nie znalazł lub nie mamy klatki
+        
+        dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+        if dist_transform.max() == 0:
+            return opening
+
+        kernel_peaks = np.ones((7, 7), np.uint8) 
+        dist_dilated = cv2.dilate(dist_transform, kernel_peaks)
+        peaks = (dist_transform == dist_dilated)
+        peaks = peaks & (dist_transform > 1.0)
+        
+        peaks_uint8 = np.uint8(peaks) * 255
+        
+        if cv2.countNonZero(peaks_uint8) == 0:
+            return opening
+        
+        ret, markers = cv2.connectedComponents(peaks_uint8)
+        markers = markers + 1
+        
+        sure_bg = cv2.dilate(opening, kernel_small, iterations=3)
+        unknown = cv2.subtract(sure_bg, np.uint8(peaks_uint8))
+        markers[unknown == 255] = 0
+        
+        mask_bgr = cv2.cvtColor(opening, cv2.COLOR_GRAY2BGR)
+        markers = cv2.watershed(mask_bgr, markers)
+        
+        mask_out = np.zeros_like(mask)
+        mask_out[markers > 1] = 255
+        
+        return mask_out
+    
+    
+    
+    def memory_post(
+            self,
+            frame_data:tuple
+    ):
+        """Store frame data to disk for long-term storage"""
+        frame_num = frame_data[0]
+        frame_path = os.path.join(self.memory_directory, f"frame_{frame_num:05d}.npz")
+        np.savez_compressed(frame_path,
+                            frame=frame_data[1],
+                            fgMask_st=frame_data[2],
+                            dbMask=frame_data[3])
+
+    
+    def memmory_get(self, frame_idx):
+        """Retrieve historical data for back-tracing"""
+        frame_path = os.path.join(self.memory_directory, f"frame_{frame_idx:05d}.npz")
+        if os.path.exists(frame_path):
+            data = np.load(frame_path)
+            return {
+                'frame': data['frame'],
+                'fgMask_st': data['fgMask_st'],
+                'dbMask': data['dbMask']
+            }
+
+    def memory_delete(self, frame_idx):
+        """Remove historical data from disk"""
+        frame_path = os.path.join(self.memory_directory, f"frame_{frame_idx:05d}.npz")
+        if os.path.exists(frame_path):
+            try:
+                os.remove(frame_path)
+            except OSError as e:
+                print(f"Error deleting {frame_path}: {e}")
+
+
+class IdGenerator:
+    def __init__(self):
+        self.current_id = 0
+
+    def get_next_id(self):
+        self.current_id += 1
+        return self.current_id
+    
 
 class BlobProcessor:
     def __init__(self, min_area=500, max_area=50000):
         self.min_area = min_area
         self.max_area = max_area
+        
+        self.hog = cv2.HOGDescriptor()
+        
+        self.id_gen = IdGenerator()
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        self.hog.setSVMDetector(cv2.HOGDescriptor.getDefaultPeopleDetector())
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-    def process(self, fg_mask):
+    def process(self, fg_mask, frame, current_frame_idx): 
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detected_candidates = []
 
-        detected_objects = []
+        frame_h, frame_w = frame.shape[:2]
+
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < self.min_area or area > self.max_area:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
-            detected_objects.append(PSO(
-                bbox = (x, y, w, h),
-                area = area,
-                center = (x + w // 2, y + h // 2)
+            
+            # --- ZABEZPIECZENIE 
+            x = max(0, x)
+            y = max(0, y)
+            if x + w > frame_w:
+                w = frame_w - x
+            if y + h > frame_h:
+                h = frame_h - y
+
+            if w <= 0 or h <= 0:
+                print("Warning: Detected bounding box has non-positive dimensions after clamping. Skipping.")
+                continue
+
+            roi = frame[y:y+h, x:x+w]
+            
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            v = np.median(gray_roi)
+            sigma = 0.33
+            lower = int(max(0, (1.0 - sigma) * v))
+            upper = int(min(255, (1.0 + sigma) * v))
+            edges = cv2.Canny(gray_roi, lower, upper)
+            
+            roi_contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            max_contour = None
+            if roi_contours:
+                max_contour = max(roi_contours, key=cv2.contourArea)
+
+            detected_candidates.append(PSO(
+                id=self.id_gen.get_next_id(),
+                bbox=(x, y, w, h),
+                area=area,
+                center=(x + w // 2, y + h // 2),
+                max_contour=max_contour,
+                frame_created_idx=current_frame_idx,
+                bg_roi=roi.copy() 
             ))
 
+        return detected_candidates
 
-        return detected_objects
-    
+class AbandonmentDetector:
+    def __init__(self):
+        self.active_objects = {}
 
+    def update(self, new_candidates, bg_model, frame_img):
+        """
+        Main logic loop executing steps 1, 3, 4, 5.
+        new_candidates: List of PSO objects detected in current frame
+        bg_model: Instance of DualBackgroundModel (for memory access)
+        current_frame: Frame number
+        frame_img: Current frame image (BGR) for CSO verification
+        """
 
+        if not self.active_objects:
+            self.active_objects = {obj.id: obj for obj in new_candidates}
+        else:
+            matched_indices = set()
+            objects_to_remove = []
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-        
-
-class ObjectDetector:
-    def __init__(self, min_area=500, max_area=50000, merge_distance=80):
-        self.min_area = min_area
-        self.max_area = max_area
-        self.merge_distance = merge_distance
-    
-    def _should_merge(self, bbox1, bbox2):
-        """Sprawdza czy dwa bbox są blisko siebie"""
-        x1, y1, w1, h1 = bbox1
-        x2, y2, w2, h2 = bbox2
-        
-        cx1, cy1 = x1 + w1//2, y1 + h1//2
-        cx2, cy2 = x2 + w2//2, y2 + h2//2
-        
-        distance = np.sqrt((cx1-cx2)**2 + (cy1-cy2)**2)
-        
-        vertical_overlap = not (y1 + h1 < y2 or y2 + h2 < y1)
-        horizontal_close = abs(cx1 - cx2) < self.merge_distance
-        
-        return (distance < self.merge_distance) or (vertical_overlap and horizontal_close)
-    
-    def _merge_bboxes(self, bboxes):
-        """Łączy bliskie boxy w grupy"""
-        if not bboxes:
-            return []
-        
-        merged = []
-        used = set()
-        
-        for i in range(len(bboxes)):
-            if i in used:
-                continue
-            
-            # Grupa boksów do połączenia
-            group = [bboxes[i]]
-            used.add(i)
-            
-            # Szukaj wszystkich boksów które powinny być w tej grupie
-            changed = True
-            while changed:
-                changed = False
-                for j in range(len(bboxes)):
-                    if j in used:
-                        continue
+            for obj_id, obj in self.active_objects.items():
+                best_match = None
+                best_iou = 0.2
+                
+                # --- CSO VERIFICATION (Independent of Foreground Mask) ---
+                # Sprawdzamy czy obiekt nadal istnieje w obrazie, nawet jeśli tło go wchłonęło
+                if obj.type_name == "CSO":
+                    x, y, w, h = obj.bbox
+                    fh, fw = frame_img.shape[:2]
                     
-                    # Sprawdź czy j pasuje do któregokolwiek w grupie
-                    for bbox_in_group in group:
-                        if self._should_merge(bbox_in_group, bboxes[j]):
-                            group.append(bboxes[j])
-                            used.add(j)
-                            changed = True
-                            break
-            
-            # Połącz wszystkie w grupie w jeden duży bbox
-            x_min = min(b[0] for b in group)
-            y_min = min(b[1] for b in group)
-            x_max = max(b[0] + b[2] for b in group)
-            y_max = max(b[1] + b[3] for b in group)
-            
-            merged.append((x_min, y_min, x_max - x_min, y_max - y_min))
+                    # 1. Dodajemy margines (padding) do ROI, żeby obiekt nie uciekł przy drobnych ruchach
+                    margin = 0
+                    if w * h < 80:
+                        margin = 20
+
+                    x_roi = max(0, x - margin)
+                    y_roi = max(0, y - margin)
+                    # Szerokość/wysokość ROI uwzględnia margines z obu stron
+                    w_roi = min(fw - x_roi, w + 2 * margin)
+                    h_roi = min(fh - y_roi, h + 2 * margin)
+                    
+                    cso_confirmed = False
+                    if w_roi > 0 and h_roi > 0:
+                        current_roi = frame_img[y_roi:y_roi+h_roi, x_roi:x_roi+w_roi]
+                        gray_roi = cv2.cvtColor(current_roi, cv2.COLOR_BGR2GRAY)
+                        
+                        # 2. Zamiast Canny -> Adaptive Threshold + Morfologia
+                        # To daje pełniejsze "plamy" (bloby) zamiast cienkich krawędzi
+                        mask_roi = cv2.adaptiveThreshold(gray_roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                       cv2.THRESH_BINARY_INV, 11, 2)
+                        
+                        # Sklejamy dziury w masce
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, kernel, iterations=2)
+                        
+                        roi_contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                        # Check contour match
+                        if roi_contours:
+                            # Szukamy największego konturu, który ma sensowny rozmiar (nie szum)
+                            max_contour = max(roi_contours, key=cv2.contourArea)
+                            
+                            if cv2.contourArea(max_contour) > 50:
+                                # Zamiast matchShapes, używamy IoU na BoundingBoxach
+                                # 1. Wyznaczamy bbox wykrytego konturu wewnątrz ROI
+                                xr, yr, wr, hr = cv2.boundingRect(max_contour)
+                                
+                                # 2. Przeliczamy na współrzędne globalne
+                                # x_roi, y_roi to lewy górny róg naszego powiększonego ROI
+                                curr_global_bbox = (x_roi + xr, y_roi + yr, wr, hr)
+                                
+                                # 3. Porównujemy z zapamiętanym bboxem obiektu
+                                iou = self._compute_iou(obj.bbox, curr_global_bbox)
+                                
+                                # print(f"CSO ID {obj.id} IoU check: {iou:.2f}")
+                                
+                                # Jeśli prostokąty się pokrywają w > 20% (zmniejszony próg bo ROI jest większe), uznajemy obiekt
+                                if iou > 0.2:
+                                    cso_confirmed = True
+                                    # Opcjonalnie: aktualizujemy bbox, żeby śledzić drobne przesunięcia
+                                    obj.bbox = curr_global_bbox 
+                        
+                    if not cso_confirmed:
+                        print(f"CSO ID {obj.id} failed authentication (lost visual), removing.")
+                        objects_to_remove.append(obj_id)
+                        continue # Skip further processing for this object
+
+                # --- PSO VERIFICATION & TRACKING (Using Foreground Mask Candidates) ---
+                
+                for cand in new_candidates:                    
+                    cand_bbox = cand.bbox
+                    obj_bbox = obj.bbox
+
+                    iou = self._compute_iou(cand_bbox, obj_bbox)
+
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_match = cand
+                        best_idx = cand.id
+                        
+
+                if best_match:
+                    matched_indices.add(best_idx)
+                    obj.bbox = best_match.bbox 
+                    obj.max_contour = best_match.max_contour 
+                    if obj.type_name == "PSO":
+                        obj.history_centers.append(best_match.center)
+                        obj.history_areas.append(best_match.area)
+                        obj.history_bboxes.append(best_match.bbox)
+                        
+                    
+                        is_stable = self._check_stability(obj)
+
+                        if is_stable:
+                            obj.stability_counter += 1
+                        else:
+                            obj.stability_counter = 0 
+                    
+                    
+                        if obj.stability_counter >= STABILITY_FRAMES:
+                            self.attempt_transition_to_cso(obj, bg_model)
+                    
+
+                elif obj.type_name == "PSO":
+                    # Jeśli PSO nie ma dopasowania w FG -> znika
+                    objects_to_remove.append(obj_id)
+
+            for obj_id in objects_to_remove:
+                if obj_id in self.active_objects:
+                    self.active_objects.pop(obj_id)
+
+            for cand in new_candidates:
+                if cand.id not in matched_indices:
+                    self.active_objects[cand.id] = cand
+
+    def attempt_transition_to_cso(self, pso, bg_model):
+        """
+        Executes Step 3 (Unattended Check) and Step 4 (Presence Authentication)
+        """
+        new_cso = CSO(pso)
+        print(f"PSO ID {pso.id} promoted to CSO ID {new_cso.id}")
+        self.active_objects[new_cso.id] = new_cso
+
+    def _compute_iou(self, boxA, boxB):
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+
+        iou = interArea / float(boxAArea + boxBArea - interArea)
+
+        return iou
+
+
+    def _check_stability(self, pso):
+        """
+        Check if the PSO has been stable using IoU.
+        """
+        if not pso.history_bboxes:
+            return True
+
+        # 1. Sprawdzenie nagłych skoków (porównanie z poprzednią klatką)
+        last_bbox = pso.history_bboxes[-1]
+        if self._compute_iou(pso.bbox, last_bbox) < 0.5:
+            return False
+
+        # 2. Sprawdzenie dryfu w czasie (porównanie z oknem 20 klatek)
+        # Zamiast sprawdzać całą historię (STABILITY_FRAMES), sprawdzamy lokalną stabilność
+        check_window = 20
+        lookback_idx = -check_window if len(pso.history_bboxes) >= check_window else 0
+        reference_bbox = pso.history_bboxes[lookback_idx]
         
-        return merged
+        iou_ref = self._compute_iou(pso.bbox, reference_bbox)
+        
+        # Wymagamy wysokiego pokrycia (np. 60%), aby uznać obiekt za nieruchomy
+        return iou_ref > 0.6
     
-    def detect_objects(self, fg_mask):
-        """Wykrywa obiekty i łączy bliskie fragmenty"""
+    def _pseudo_blob_detector(self, fg_mask):
+        """Detect blobs from a foreground mask (grayscale)"""
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Zbierz wszystkie bbox powyżej min_area
-        bboxes = []
+        detected_candidates = []
+
+        frame_h, frame_w = fg_mask.shape[:2]
+        MIN_AREA = 100
+        MAX_AREA = 10000
+
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area > self.min_area:
-                x, y, w, h = cv2.boundingRect(contour)
-                bboxes.append((x, y, w, h))
-        
-        # Połącz bliskie boksy
-        merged_bboxes = self._merge_bboxes(bboxes)
-        
-        # Utwórz finalne obiekty
-        detected_objects = []
-        for bbox in merged_bboxes:
-            x, y, w, h = bbox
-            area = w * h
-            
-            # Po merge akceptuj większe obiekty (do 3x max_area)
-            
-            detected_objects.append({
-                'bbox': (x, y, w, h),
-                'area': area,
-                'center': (x + w//2, y + h//2)
-            })
-        
-        return detected_objects
-
-
-class ObjectTracker:
-    """Tracking obiektów z wykrywaniem stacjonarności"""
-    
-    def __init__(self, iou_threshold=0.3, stationary_threshold=30, movement_threshold=5):
-        self.iou_threshold = iou_threshold
-        self.stationary_threshold = stationary_threshold
-        self.movement_threshold = movement_threshold  # Piksele ruchu centrum
-        self.next_id = 0
-        self.tracked_objects = {}
-        self.stationary_regions = {}  # Regiony do sprawdzenia z referencją
-        
-    def calculate_iou(self, bbox1, bbox2):
-        """Oblicza IoU (Intersection over Union)"""
-        x1, y1, w1, h1 = bbox1
-        x2, y2, w2, h2 = bbox2
-        
-        xi1 = max(x1, x2)
-        yi1 = max(y1, y2)
-        xi2 = min(x1 + w1, x2 + w2)
-        yi2 = min(y1 + h1, y2 + h2)
-        
-        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-        
-        box1_area = w1 * h1
-        box2_area = w2 * h2
-        union_area = box1_area + box2_area - inter_area
-        
-        iou = inter_area / union_area if union_area > 0 else 0
-        return iou
-    
-    def calculate_movement(self, center1, center2):
-        """Oblicza odległość między środkami"""
-        # Oblicza odległość euklidesową między środkami dwóch obiektów
-        dx = center1[0] - center2[0]
-        dy = center1[1] - center2[1]
-        return np.sqrt(dx**2 + dy**2)
-    
-    def update(self, detected_objects, frame_num):
-        """Aktualizuje tracking obiektów"""
-        updated_ids = set()
-        result = []
-        
-        for det_obj in detected_objects: # Dla każdego nowo wykrytego obiektu
-            best_match_id = None
-            best_iou = 0
-            
-            # Sprawdź wszystkie śledzone obiekty
-            for track_id, track_obj in self.tracked_objects.items():
-                iou = self.calculate_iou(det_obj['bbox'], track_obj['bbox'])
-                
-                # Znajdź najlepsze dopasowanie
-                if iou > self.iou_threshold and iou > best_iou: # Jeśli prostokąty pokrywają się (np. >30%)
-                    best_iou = iou                              # To prawdopodobnie ten sam obiekt w następnej klatce
-                    best_match_id = track_id
-            
-            if best_match_id is not None:
-                track_obj = self.tracked_objects[best_match_id]
-                movement = self.calculate_movement(det_obj['center'], track_obj['center'])
-                
-                # Sprawdź ruch centrum
-                if movement < self.movement_threshold:
-                    track_obj['frames_stationary'] += 1
-                else:
-                    track_obj['frames_stationary'] = 0
-                    # Jeśli obiekt się poruszył, usuń z regionów stacjonarnych
-                    if best_match_id in self.stationary_regions:
-                        del self.stationary_regions[best_match_id]
-                
-                 # Aktualizuj pozycję i dane
-                track_obj['bbox'] = det_obj['bbox']
-                track_obj['center'] = det_obj['center']
-                track_obj['area'] = det_obj['area']
-                track_obj['last_seen'] = frame_num
-                
-                updated_ids.add(best_match_id)
-                
-                # Jeśli stał się stacjonarny, dodaj do regionów do sprawdzenia
-                if track_obj['frames_stationary'] >= self.stationary_threshold:
-                    if best_match_id not in self.stationary_regions:
-                        self.stationary_regions[best_match_id] = {
-                            'bbox': det_obj['bbox'],
-                            'first_stationary_frame': frame_num,
-                            'last_checked': frame_num
-                        }
-                
-                result.append({
-                    'id': best_match_id,
-                    'bbox': det_obj['bbox'],
-                    'center': det_obj['center'],
-                    'area': det_obj['area'],
-                    'frames_stationary': track_obj['frames_stationary'],
-                    'is_stationary': track_obj['frames_stationary'] >= self.stationary_threshold,
-                    'duration': frame_num - track_obj['first_seen']
-                })
-            else: # Nie znaleziono dopasowania
-                new_id = self.next_id
-                self.next_id += 1
-                
-                # Utwórz nowy track
-                self.tracked_objects[new_id] = {
-                    'bbox': det_obj['bbox'],
-                    'center': det_obj['center'],
-                    'area': det_obj['area'],
-                    'frames_stationary': 0,
-                    'first_seen': frame_num,
-                    'last_seen': frame_num
-                }
-                
-                updated_ids.add(new_id)
-                
-                result.append({
-                    'id': new_id,
-                    'bbox': det_obj['bbox'],
-                    'center': det_obj['center'],
-                    'area': det_obj['area'],
-                    'frames_stationary': 0,
-                    'is_stationary': False,
-                    'duration': 0
-                })
-        
-        # Usuń stare tracki
-        ids_to_remove = []
-        for track_id, track_obj in self.tracked_objects.items():
-            # Jeśli obiekt nie był widziany przez >30 klatek
-            if track_id not in updated_ids and (frame_num - track_obj['last_seen']) > 30:
-                ids_to_remove.append(track_id)
-        
-        for track_id in ids_to_remove:
-            del self.tracked_objects[track_id]
-            if track_id in self.stationary_regions:
-                del self.stationary_regions[track_id]
-        
-        return result
-    
-    def check_stationary_regions(self, frame, reference_frame, frame_num, check_interval=10, min_diff_area=100):
-        """Sprawdza regiony stacjonarne vs referencja, zwraca abandoned objects"""
-        abandoned = []
-        
-        for track_id, region_info in list(self.stationary_regions.items()):
-            # Sprawdzaj co N klatek
-            if frame_num - region_info['last_checked'] < check_interval:
+            if area < MIN_AREA or area > MAX_AREA:
                 continue
+
+            x, y, w, h = cv2.boundingRect(contour)
             
-            region_info['last_checked'] = frame_num
-            
-            x, y, w, h = region_info['bbox']
-            
-            # Wytnij region z obecnej klatki i referencji
-            x1, y1 = max(0, x), max(0, y)
-            x2, y2 = min(frame.shape[1], x+w), min(frame.shape[0], y+h)
-            
-            if x2 <= x1 or y2 <= y1:
+            # Sanity Checks
+            x = max(0, x)
+            y = max(0, y)
+
+            if x + w > frame_w:
+                w = frame_w - x
+
+            if y + h > frame_h:
+                h = frame_h - y
+
+            if w <= 0 or h <= 0:
                 continue
+
+            roi = fg_mask[y:y+h, x:x+w]
+
+            # --- Extract contour edges from mask ---
+            # fg_mask is already binary, use Canny directly
+            edges = cv2.Canny(roi, 50, 150)
             
-            current_region = frame[y1:y2, x1:x2]
-            reference_region = reference_frame[y1:y2, x1:x2]
+            roi_contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # Porównaj regiony
-            curr_gray = cv2.cvtColor(current_region, cv2.COLOR_BGR2GRAY)
-            ref_gray = cv2.cvtColor(reference_region, cv2.COLOR_BGR2GRAY)
+            max_contour = None
+            if roi_contours:
+                max_contour = max(roi_contours, key=cv2.contourArea)
             
-            diff = cv2.absdiff(curr_gray, ref_gray)
-            _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-            
-            # Policz piksele różnicy
-            diff_pixels = np.sum(thresh > 0)
-            
-            # Jeśli jest wystarczająco dużo różnicy, to faktycznie coś tam zostało
-            if diff_pixels > min_diff_area:
-                abandoned.append({
-                    'id': track_id,
-                    'bbox': region_info['bbox'],
-                    'center': (x + w//2, y + h//2),
-                    'stationary_duration': frame_num - region_info['first_stationary_frame'],
-                    'diff_pixels': diff_pixels
-                })
-        
-        return abandoned
+
+            detected_candidates.append(PSO(
+                bbox=(x, y, w, h),
+                area=area,
+                center=(x + w // 2, y + h // 2),
+                max_contour=max_contour
+            ))
+
+        return detected_candidates
